@@ -552,6 +552,8 @@ pub struct Queue {
     queue: VecDeque<Message>,
     /// Message buffer reused across verdict calls
     verdict_buffer: Option<Box<[u32; (8192 + 0x10000) / 4]>>,
+    /// Hold the `tokio::io::PollEvented`
+    socket: AsyncSocket,
 }
 
 unsafe impl Send for Queue {}
@@ -572,6 +574,7 @@ impl Queue {
             buffer: Arc::new(Vec::with_capacity(metadata_size)),
             queue: VecDeque::new(),
             verdict_buffer: Some(Box::new(unsafe { std::mem::zeroed() })),
+            socket: AsyncSocket::new(fd as _)?,
         };
 
         let mut addr: sockaddr_nl = unsafe { std::mem::zeroed() };
@@ -598,9 +601,9 @@ impl Queue {
         Ok(())
     }
 
-    async unsafe fn send_nlmsg(&self, mut nlh: Nlmsg<'_>) -> std::io::Result<()> {
+    async unsafe fn send_nlmsg(&mut self, mut nlh: Nlmsg<'_>) -> std::io::Result<()> {
         nlh.adjust_len();
-        AsyncSocket::new(self.fd as _)?.send_to(nlh.as_slice(), &SocketAddr::new()).await?;
+        self.socket.send_to(nlh.as_slice(), &SocketAddr::new()).await?;
         // if sendto(
         //     self.fd,
         //     nlh as _, (*nlh).nlmsg_len as _, 0,
@@ -769,7 +772,7 @@ impl Queue {
         unsafe { buf.set_len(buf_size) }
 
         let buf_slice = unsafe {std::slice::from_raw_parts_mut(buf.as_mut_ptr() as _, buf_size * 4)};
-        let mut size = AsyncSocket::new(self.fd as _)?.recv(buf_slice, MSG_TRUNC).await?;
+        let mut size = self.socket.recv(buf_slice, MSG_TRUNC).await?;
         // let size = unsafe { recv(self.fd, buf.as_mut_ptr() as _, buf_size * 4, MSG_TRUNC) };
         // if size < 0 {
         //     return Err(std::io::Error::last_os_error());
