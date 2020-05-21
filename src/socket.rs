@@ -87,12 +87,6 @@ impl SocketAddr {
         let addr_len = mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t;
         (addr_ptr, addr_len)
     }
-
-    fn as_raw_mut(&mut self) -> (*mut libc::sockaddr, libc::socklen_t) {
-        let addr_ptr = &mut self.0 as *mut libc::sockaddr_nl as *mut libc::sockaddr;
-        let addr_len = mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t;
-        (addr_ptr, addr_len)
-    }
 }
 
 impl Socket {
@@ -103,96 +97,6 @@ impl Socket {
             return Err(Error::last_os_error());
         }
         Ok(())
-    }
-
-    pub fn connect(&self, remote_addr: &SocketAddr) -> Result<()> {
-        // Event though for SOCK_DGRAM sockets there's no IO, since our socket is non-blocking,
-        // connect() might return EINPROGRESS. In theory, the right way to treat EINPROGRESS would
-        // be to ignore the error, and let the user poll the socket to check when it becomes
-        // writable, indicating that the connection succeeded. The code already exists in mio for
-        // TcpStream:
-        //
-        // > pub fn connect(stream: net::TcpStream, addr: &SocketAddr) -> io::Result<TcpStream> {
-        // >     set_non_block(stream.as_raw_fd())?;
-        // >     match stream.connect(addr) {
-        // >         Ok(..) => {}
-        // >         Err(ref e) if e.raw_os_error() == Some(libc::EINPROGRESS) => {}
-        // >         Err(e) => return Err(e),
-        // >     }
-        // >     Ok(TcpStream {  inner: stream })
-        // > }
-        //
-        // The polling to wait for the connection is available in the tokio-tcp crate. See:
-        // https://github.com/tokio-rs/tokio/blob/363b207f2b6c25857c70d76b303356db87212f59/tokio-tcp/src/stream.rs#L706
-        //
-        // In practice, since the connection does not require any IO for SOCK_DGRAM sockets, it
-        // almost never returns EINPROGRESS and so for now, we just return whatever libc::connect
-        // returns. If it returns EINPROGRESS, the caller will have to handle the error themself
-        //
-        // Refs:
-        //
-        // - https://stackoverflow.com/a/14046386/1836144
-        // - https://lists.isc.org/pipermail/bind-users/2009-August/077527.html
-        let (addr, addr_len) = remote_addr.as_raw();
-        let res = unsafe { libc::connect(self.0, addr, addr_len) };
-        if res < 0 {
-            return Err(Error::last_os_error());
-        }
-        Ok(())
-    }
-
-    // Most of the comments in this method come from a discussion on rust users forum.
-    // [thread]: https://users.rust-lang.org/t/help-understanding-libc-call/17308/9
-    //
-    // WARNING: with datagram oriented protocols, `recv` and
-    // `recvfrom` receive normally only ONE datagram, but it seems not
-    // to be verified for Netlink sockets: multiple message can be
-    // received in a single call.
-    pub fn recv_from(&self, buf: &mut [u8], flags: libc::c_int) -> Result<(usize, SocketAddr)> {
-        // Create an empty storage for the address. Note that Rust standard library create a
-        // sockaddr_storage so that it works for any address family, but here, we already know that
-        // we'll have a Netlink address, so we can create the appropriate storage.
-        let mut addr = unsafe { mem::zeroed::<libc::sockaddr_nl>() };
-
-        // recvfrom takes a *sockaddr as parameter so that it can accept any kind of address
-        // storage, so we need to create such a pointer for the sockaddr_nl we just initialized.
-        //
-        //                     Create a raw pointer to        Cast our raw pointer to a
-        //                     our storage. We cannot         generic pointer to *sockaddr
-        //                     pass it to recvfrom yet.       that recvfrom can use
-        //                                 ^                              ^
-        //                                 |                              |
-        //                  +--------------+---------------+    +---------+--------+
-        //                 /                                \  /                    \
-        let addr_ptr = &mut addr as *mut libc::sockaddr_nl as *mut libc::sockaddr;
-
-        // Why do we need to pass the address length? We're passing a generic *sockaddr to
-        // recvfrom. Somehow recvfrom needs to make sure that the address of the received packet
-        // would fit into the actual type that is behind *sockaddr: it could be a sockaddr_nl but
-        // also a sockaddr_in, a sockaddr_in6, or even the generic sockaddr_storage that can store
-        // any address.
-        let mut addrlen = mem::size_of_val(&addr);
-        // recvfrom does not take the address length by value (see [thread]), so we need to create
-        // a pointer to it.
-        let addrlen_ptr = &mut addrlen as *mut usize as *mut libc::socklen_t;
-
-        //                      Cast the *mut u8 into *mut void.
-        //               This is equivalent to casting a *char into *void
-        //                                 See [thread]
-        //                                       ^
-        //           Create a *mut u8            |
-        //                   ^                   |
-        //                   |                   |
-        //             +-----+-----+    +--------+-------+
-        //            /             \  /                  \
-        let buf_ptr = buf.as_mut_ptr() as *mut libc::c_void;
-        let buf_len = buf.len() as libc::size_t;
-
-        let res = unsafe { libc::recvfrom(self.0, buf_ptr, buf_len, flags, addr_ptr, addrlen_ptr) };
-        if res < 0 {
-            return Err(Error::last_os_error());
-        }
-        Ok((res as usize, SocketAddr(addr)))
     }
 
     pub fn recv(&self, buf: &mut [u8], flags: libc::c_int) -> Result<usize> {
@@ -212,17 +116,6 @@ impl Socket {
         let buf_len = buf.len() as libc::size_t;
 
         let res = unsafe { libc::sendto(self.0, buf_ptr, buf_len, flags, addr_ptr, addr_len) };
-        if res < 0 {
-            return Err(Error::last_os_error());
-        }
-        Ok(res as usize)
-    }
-
-    pub fn send(&self, buf: &[u8], flags: libc::c_int) -> Result<usize> {
-        let buf_ptr = buf.as_ptr() as *const libc::c_void;
-        let buf_len = buf.len() as libc::size_t;
-
-        let res = unsafe { libc::send(self.0, buf_ptr, buf_len, flags) };
         if res < 0 {
             return Err(Error::last_os_error());
         }
