@@ -19,9 +19,9 @@
 //!    let mut queue = Queue::open()?;
 //!    queue.bind(0).await?;
 //!    loop {
-//!        let mut msg = queue.receiver().recv().await?;
+//!        let mut msg = queue.recv().await?;
 //!        msg.set_verdict(Verdict::Accept);
-//!        queue.sender().verdict(msg).await?;
+//!        queue.verdict(msg).await?;
 //!    }
 //!    Ok(())
 //! }
@@ -925,18 +925,41 @@ impl Queue {
         Ok(())
     }
 
-    // Receiver (can run on separate thread)
-    pub fn receiver(&self) -> QueueReceive {
-        QueueReceive::new(&self)
+    /// Receive a packet from the queue.
+    pub async fn recv(&mut self) -> Result<Message> {
+        QueueReceive::new(self).recv().await
     }
 
-    // Sender (can run on separate thread)
-    pub fn sender(&self) -> QueueSend {
-        QueueSend::new(&self)
+    /// Verdict a message.
+    pub async fn verdict(&mut self, msg: Message) -> Result<()> {
+        QueueSend::new(self).verdict(msg).await
+    }
+
+    /// Sender/Receiver pair for concurrent processing
+    /// ```no_run
+    /// use nfq::{Queue, Verdict};
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> std::io::Result<()> {
+    ///     let mut queue = Queue::open()?;
+    ///     queue.bind(0).await?;
+    ///     loop {
+    ///         let (mut tx, mut rx) = queue.concurrent();
+    ///         let mut msg = tx.recv().await?;
+    ///         tokio::join!(tx.recv(), rx.verdict(msg));
+    ///     }
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn concurrent(&mut self) -> (QueueReceive, QueueSend) {
+        (QueueReceive::new(self), QueueSend::new(self))
     }
 }
 
 impl<'a> QueueReceive<'a> {
+    // While PollEvented is Sync, the caller must ensure that there are at most two tasks
+    // that use a PollEvented instance concurrently.
+    // One for reading and one for writing.
     fn new(q: &'a Queue) -> Self {
         Self {
             q,
@@ -967,6 +990,9 @@ impl<'a> QueueReceive<'a> {
 }
 
 impl<'a> QueueSend<'a> {
+    // While PollEvented is Sync, the caller must ensure that there are at most two tasks
+    // that use a PollEvented instance concurrently.
+    // One for reading and one for writing.
     fn new(q: &'a Queue) -> Self {
         Self {
             q,
