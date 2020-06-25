@@ -945,14 +945,14 @@ impl Queue {
     ///     queue.bind(0).await?;
     ///     loop {
     ///         let (mut tx, mut rx) = queue.concurrent();
-    ///         let mut msg = tx.recv().await?;
-    ///         tokio::join!(tx.recv(), rx.verdict(msg));
+    ///         let mut msg = rx.recv().await?;
+    ///         tokio::join!(rx.recv(), tx.verdict(msg));
     ///     }
     ///     Ok(())
     /// }
     /// ```
-    pub fn concurrent(&mut self) -> (QueueReceive, QueueSend) {
-        (QueueReceive::new(self), QueueSend::new(self))
+    pub fn concurrent(&mut self) -> (QueueSend, QueueReceive) {
+        (QueueSend::new(self), QueueReceive::new(self))
     }
 }
 
