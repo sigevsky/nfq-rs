@@ -1,7 +1,6 @@
 // From https://github.com/little-dude/netlink/tree/master/netlink-sys/
 //! Netlink socket related functions
 use futures::{future::poll_fn, ready};
-use libc;
 use mio::event::Evented;
 use mio::unix::EventedFd;
 use tokio::io::PollEvented;

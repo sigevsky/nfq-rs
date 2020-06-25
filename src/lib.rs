@@ -995,11 +995,9 @@ impl<'a> QueueSend<'a> {
                 nlmsg.put_u32(NFQA_MARK as u16, msg.nfmark);
             }
             if let PayloadState::Unmodified = msg.payload_state {
-            } else {
-                if msg.verdict != Verdict::Drop {
-                    let payload = msg.get_payload();
-                    nlmsg.put_slice(NFQA_PAYLOAD as u16, payload);
-                }
+            } else if msg.verdict != Verdict::Drop {
+                let payload = msg.get_payload();
+                nlmsg.put_slice(NFQA_PAYLOAD as u16, payload);
             }
             let ret = self.q.send_nlmsg(nlmsg).await;
             self.verdict_buffer = Some(buffer);
