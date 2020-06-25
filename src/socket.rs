@@ -161,12 +161,12 @@ impl AsyncSocket {
         Ok(AsyncSocket(PollEvented::new(socket)?))
     }
 
-    pub async fn send_to(&mut self, buf: &[u8], addr: &SocketAddr) -> io::Result<usize> {
+    pub async fn send_to(&self, buf: &[u8], addr: &SocketAddr) -> io::Result<usize> {
         poll_fn(|cx| self.poll_send_to(cx, buf, addr)).await
     }
 
     pub fn poll_send_to(
-        &mut self,
+        &self,
         cx: &mut Context,
         buf: &[u8],
         addr: &SocketAddr,
@@ -181,7 +181,7 @@ impl AsyncSocket {
         }
     }
 
-    pub async fn recv(&mut self, buf: &mut [u8], flags: libc::c_int) -> io::Result<usize> {
+    pub async fn recv(&self, buf: &mut [u8], flags: libc::c_int) -> io::Result<usize> {
         poll_fn(|cx| {
             // Check if the socket is readable. If not,
             // PollEvented::poll_read_ready would have arranged for the

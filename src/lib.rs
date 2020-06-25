@@ -19,9 +19,9 @@
 //!    let mut queue = Queue::open()?;
 //!    queue.bind(0).await?;
 //!    loop {
-//!        let mut msg = queue.recv().await?;
+//!        let mut msg = queue.receiver().recv().await?;
 //!        msg.set_verdict(Verdict::Accept);
-//!        queue.verdict(msg).await?;
+//!        queue.sender().verdict(msg).await?;
 //!    }
 //!    Ok(())
 //! }
@@ -542,14 +542,14 @@ unsafe fn parse_attr(attr: *const nlattr, message: &mut Message) {
     }
 }
 
-unsafe fn parse_msg(nlh: *const nlmsghdr, queue: &mut Queue) {
+unsafe fn parse_msg(nlh: *const nlmsghdr, buffer: &Arc<Vec<u32>>, queue: &mut VecDeque<Message>) {
     const NFGEN_HDRLEN: usize = nfq_align(std::mem::size_of::<nfgenmsg>());
     let nfgenmsg = (nlh as usize + NLMSG_HDRLEN) as *const nfgenmsg;
     let attr_start = (nfgenmsg as usize + NFGEN_HDRLEN) as *const u32;
     let attr_len = (*nlh).nlmsg_len as usize - NLMSG_HDRLEN - NFGEN_HDRLEN;
 
     let mut message = Message {
-        buffer: Arc::clone(&queue.buffer),
+        buffer: Arc::clone(buffer),
         id: be16_to_cpu((*nfgenmsg).res_id),
         hdr: std::ptr::null(),
         nfmark: 0,
@@ -579,26 +579,35 @@ unsafe fn parse_msg(nlh: *const nlmsghdr, queue: &mut Queue) {
 
     assert!(!message.hdr.is_null());
 
-    queue.queue.push_back(message);
+    queue.push_back(message);
 }
 
 /// A NetFilter queue.
 pub struct Queue {
     /// NetLink socket
     fd: libc::c_int,
+    /// Hold the `tokio::io::PollEvented`
+    socket: AsyncSocket,
     bufsize: usize,
     /// In order to support out-of-order verdict and batch recv, we need to carefully manage the
     /// lifetime of buffer, so that buffer is never freed before all messages are dropped.
     /// We use Arc for this case, and keep an extra copy here, so that if all messages are handled
     /// before call to `recv`, we can re-use the buffer.
     buffer: Arc<Vec<u32>>,
+}
+
+pub struct QueueReceive<'a> {
+    q: &'a Queue,
+    buffer: Arc<Vec<u32>>,
     /// We can receive multiple messages from kernel in a single recv, so we keep a queue
     /// internally before everything is consumed.
     queue: VecDeque<Message>,
+}
+
+pub struct QueueSend<'a> {
+    q: &'a Queue,
     /// Message buffer reused across verdict calls
     verdict_buffer: Option<Box<[u32; (8192 + 0x10000) / 4]>>,
-    /// Hold the `tokio::io::PollEvented`
-    socket: AsyncSocket,
 }
 
 unsafe impl Send for Queue {}
@@ -617,8 +626,6 @@ impl Queue {
             fd,
             bufsize: metadata_size,
             buffer: Arc::new(Vec::with_capacity(metadata_size)),
-            queue: VecDeque::new(),
-            verdict_buffer: Some(Box::new(unsafe { std::mem::zeroed() })),
             socket: AsyncSocket::new(fd as _)?,
         };
 
@@ -659,7 +666,7 @@ impl Queue {
         Ok(())
     }
 
-    async unsafe fn send_nlmsg(&mut self, mut nlh: Nlmsg<'_>) -> std::io::Result<()> {
+    async unsafe fn send_nlmsg(&self, mut nlh: Nlmsg<'_>) -> std::io::Result<()> {
         nlh.adjust_len();
         self.socket
             .send_to(nlh.as_slice(), &SocketAddr::new())
@@ -840,14 +847,17 @@ impl Queue {
     // Receive an nlmsg, using callback to process them. If Ok(true) is returned it means we got an
     // ACK.
     async fn recv_nlmsg(
-        &mut self,
-        mut callback: impl FnMut(&mut Self, *const nlmsghdr),
+        socket: &AsyncSocket,
+        bufsize: usize,
+        buffer: &mut Arc<Vec<u32>>,
+        mut callback: impl FnMut(&Arc<Vec<u32>>, *const nlmsghdr),
     ) -> Result<bool> {
-        let buf = match Arc::get_mut(&mut self.buffer) {
+        // TODO: Statisfy the borrow checker with a cleaner signature
+        let buf = match Arc::get_mut(buffer) {
             Some(v) => v,
             None => {
-                self.buffer = Arc::new(Vec::with_capacity(self.bufsize));
-                Arc::get_mut(&mut self.buffer).unwrap()
+                std::mem::replace(buffer, Arc::new(Vec::with_capacity(bufsize)));
+                Arc::get_mut(buffer).unwrap()
             }
         };
         let buf_size = buf.capacity();
@@ -855,7 +865,7 @@ impl Queue {
 
         let buf_slice =
             unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr() as _, buf_size * 4) };
-        let mut size = self.socket.recv(buf_slice, MSG_TRUNC).await?;
+        let mut size = socket.recv(buf_slice, MSG_TRUNC).await?;
         // let size = unsafe { recv(self.fd, buf.as_mut_ptr() as _, buf_size * 4, MSG_TRUNC) };
         // if size < 0 {
         //     return Err(std::io::Error::last_os_error());
@@ -894,7 +904,7 @@ impl Queue {
                 }
                 NLMSG_DONE => return Ok(true),
                 v if v < NLMSG_MIN_TYPE => (),
-                _ => callback(self, nlh),
+                _ => callback(buffer, nlh),
             }
 
             let aligned_len = nfq_align(nlmsg_len);
@@ -911,22 +921,57 @@ impl Queue {
     // Receive the next error message. Returns Ok only if errno is 0 (which is a response to a
     // message with F_ACK set).
     async fn recv_error(&mut self) -> Result<()> {
-        while !self.recv_nlmsg(|_, _| ()).await? {}
+        while !Self::recv_nlmsg(&self.socket, self.bufsize, &mut self.buffer, |_, _| ()).await? {}
         Ok(())
+    }
+
+    // Receiver (can run on separate thread)
+    pub fn receiver(&self) -> QueueReceive {
+        QueueReceive::new(&self)
+    }
+
+    // Sender (can run on separate thread)
+    pub fn sender(&self) -> QueueSend {
+        QueueSend::new(&self)
+    }
+}
+
+impl<'a> QueueReceive<'a> {
+    fn new(q: &'a Queue) -> Self {
+        Self {
+            q,
+            buffer: Arc::new(Vec::with_capacity(q.bufsize)),
+            queue: VecDeque::new(),
+        }
     }
 
     /// Receive a packet from the queue.
     pub async fn recv(&mut self) -> Result<Message> {
         // We have processed all messages in previous recv batch, do next iteration
         while self.queue.is_empty() {
-            self.recv_nlmsg(|this, nlh| {
-                unsafe { parse_msg(nlh, this) };
-            })
+            let q = &mut self.queue;
+            Queue::recv_nlmsg(
+                &self.q.socket,
+                self.q.bufsize,
+                &mut self.buffer,
+                |buf, nlh| {
+                    unsafe { parse_msg(nlh, buf, q) };
+                },
+            )
             .await?;
         }
 
         let msg = self.queue.pop_front().unwrap();
         Ok(msg)
+    }
+}
+
+impl<'a> QueueSend<'a> {
+    fn new(q: &'a Queue) -> Self {
+        Self {
+            q,
+            verdict_buffer: Some(Box::new(unsafe { std::mem::zeroed() })),
+        }
     }
 
     /// Verdict a message.
@@ -956,7 +1001,7 @@ impl Queue {
                     nlmsg.put_slice(NFQA_PAYLOAD as u16, payload);
                 }
             }
-            let ret = self.send_nlmsg(nlmsg).await;
+            let ret = self.q.send_nlmsg(nlmsg).await;
             self.verdict_buffer = Some(buffer);
             ret
         }
