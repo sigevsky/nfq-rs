@@ -1,16 +1,12 @@
 // From https://github.com/little-dude/netlink/tree/master/netlink-sys/
 //! Netlink socket related functions
-use futures::{future::poll_fn, ready};
-use mio::event::Evented;
-use mio::unix::EventedFd;
-use tokio::io::PollEvented;
-
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::io::{self, Error, Result};
 use std::mem;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::task::{Context, Poll};
+use netlink_sys::TokioSocket;
 
 #[derive(Clone, Debug)]
 pub struct Socket(RawFd);
@@ -97,87 +93,21 @@ impl Socket {
         }
         Ok(())
     }
-
-    pub fn recv(&self, buf: &mut [u8], flags: libc::c_int) -> Result<usize> {
-        let buf_ptr = buf.as_mut_ptr() as *mut libc::c_void;
-        let buf_len = buf.len() as libc::size_t;
-
-        let res = unsafe { libc::recv(self.0, buf_ptr, buf_len, flags) };
-        if res < 0 {
-            return Err(Error::last_os_error());
-        }
-        Ok(res as usize)
-    }
-
-    pub fn send_to(&self, buf: &[u8], addr: &SocketAddr, flags: libc::c_int) -> Result<usize> {
-        let (addr_ptr, addr_len) = addr.as_raw();
-        let buf_ptr = buf.as_ptr() as *const libc::c_void;
-        let buf_len = buf.len() as libc::size_t;
-
-        let res = unsafe { libc::sendto(self.0, buf_ptr, buf_len, flags, addr_ptr, addr_len) };
-        if res < 0 {
-            return Err(Error::last_os_error());
-        }
-        Ok(res as usize)
-    }
 }
 
-/// Implement mio
-impl Evented for Socket {
-    fn register(
-        &self,
-        poll: &mio::Poll,
-        token: mio::Token,
-        interest: mio::Ready,
-        opts: mio::PollOpt,
-    ) -> io::Result<()> {
-        EventedFd(&self.as_raw_fd()).register(poll, token, interest, opts)
-    }
-
-    fn reregister(
-        &self,
-        poll: &mio::Poll,
-        token: mio::Token,
-        interest: mio::Ready,
-        opts: mio::PollOpt,
-    ) -> io::Result<()> {
-        EventedFd(&self.as_raw_fd()).reregister(poll, token, interest, opts)
-    }
-
-    fn deregister(&self, poll: &mio::Poll) -> io::Result<()> {
-        EventedFd(&self.as_raw_fd()).deregister(poll)
-    }
-}
 
 /// An I/O object representing a Netlink socket.
 /// This custom implementation only borrows the sockets, it does not close() on drop
-pub struct AsyncSocket(PollEvented<Socket>);
+pub struct AsyncSocket(TokioSocket);
 
 impl AsyncSocket {
-    pub fn new(fd: RawFd) -> io::Result<Self> {
-        let socket = unsafe { Socket::from_raw_fd(fd) };
-        socket.set_non_blocking(true)?;
-        Ok(AsyncSocket(PollEvented::new(socket)?))
+    pub fn new(fd: RawFd) -> Self {
+        let socket = unsafe { TokioSocket::from_raw_fd(fd) };
+        Ok(AsyncSocket(socket))
     }
 
-    pub async fn send_to(&self, buf: &[u8], addr: &SocketAddr) -> io::Result<usize> {
-        poll_fn(|cx| self.poll_send_to(cx, buf, addr)).await
-    }
-
-    pub fn poll_send_to(
-        &self,
-        cx: &mut Context,
-        buf: &[u8],
-        addr: &SocketAddr,
-    ) -> Poll<io::Result<usize>> {
-        ready!(self.0.poll_write_ready(cx))?;
-        match self.0.get_ref().send_to(buf, addr, 0) {
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                self.0.clear_write_ready(cx)?;
-                Poll::Pending
-            }
-            x => Poll::Ready(x),
-        }
+    pub async fn send_to(&mut self, buf: &[u8], addr: &SocketAddr) -> io::Result<usize> {
+        poll_fn(|cx| self.0.poll_send_to(cx, buf, addr)).await
     }
 
     pub async fn recv(&self, buf: &mut [u8], flags: libc::c_int) -> io::Result<usize> {
